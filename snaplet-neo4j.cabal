@@ -1,0 +1,27 @@
+name:                snaplet-neo4j
+version:             0.0.0.0
+synopsis:            A snaplet for connecting to Neo4j
+-- description:         
+homepage:            http://github.com/zearen-wover/snaplet-neo4j
+license:             BSD3
+license-file:        LICENSE
+author:              Zie Weaver
+maintainer:          zearen.wover@gmail.com
+-- copyright:           
+category:            Snap
+build-type:          Simple
+extra-source-files:  README.md
+cabal-version:       >=1.10
+
+library
+  exposed-modules:     
+    Snap.Snaplet.Neo4j
+  other-modules:
+    Snap.Snaplet.Neo4j.Internal
+  build-depends:
+    base >= 4.0 && < 5.0,
+    haskell-neo4j-client >= 0.3 && < 0.4,
+    snap >= 0.9 && < 0.15,
+    transformers >= 0.2 && < 0.5
+  default-language:
+    Haskell98
