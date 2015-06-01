@@ -32,9 +32,9 @@ data PropertyNames = PropertyNames
   , propUpdatedAt :: T.Text
   , propResetToken :: T.Text
   , propResetRequestedAt :: T.Text
+  , propMeta :: T.Text
   , relROLE :: T.Text
   , indexRole :: Maybe T.Text
-  , relMETA :: T.Text
   }
 
   
