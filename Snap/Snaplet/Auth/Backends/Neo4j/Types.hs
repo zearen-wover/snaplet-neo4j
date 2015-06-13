@@ -13,7 +13,7 @@ data Neo4jAuthManager = Neo4jAuthManager
   }
 
 data PropertyNames = PropertyNames
-  { indexUser :: Maybe T.Text
+  { labelUser :: T.Text
   , propRole :: T.Text
   , propLogin :: T.Text
   , propEmail :: T.Text
@@ -34,7 +34,7 @@ data PropertyNames = PropertyNames
   , propResetRequestedAt :: T.Text
   , propMeta :: T.Text
   , relROLE :: T.Text
-  , indexRole :: Maybe T.Text
+  , labelRole :: T.Text
   }
 
   
