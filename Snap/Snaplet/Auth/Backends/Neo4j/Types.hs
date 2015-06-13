@@ -3,7 +3,7 @@ module Snap.Snaplet.Auth.Backends.Neo4j.Types
   , PropertyNames(..)
   ) where
 
-import Data.Text as T
+import qualified Data.Text as T
 
 import Snap.Snaplet.Neo4j.Internal ( Neo4jSnaplet(..) )
 

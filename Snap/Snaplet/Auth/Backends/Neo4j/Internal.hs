@@ -3,8 +3,11 @@
 {-# LANGUAGE RecordWildCards #-}
 module Snap.Snaplet.Auth.Backends.Neo4j.Internal where
 
-import Control.Monad ( sequence )
+import Control.Applicative ( (<$>) )
+import Control.Monad ( join, mapM_, sequence )
 import Control.Monad.IO.Class ( liftIO )
+import Control.Monad.Trans.Class ( lift )
+import Control.Monad.Trans.Maybe ( MaybeT(MaybeT, runMaybeT) )
 import Data.Monoid ( mconcat, (<>) ) 
 import Data.String ( fromString )
 import System.IO ( FilePath )
@@ -15,7 +18,6 @@ import Data.Time.Clock ( UTCTime )
 import Data.Time.Format ( formatTime, parseTime )
 import Data.Word ( Word8 )
 import Database.Neo4j ( Neo4j, Hostname, Port )
-import Database.Neo4j.Transactional.Cypher as Neo4j
 import Snap.Snaplet ( Snaplet, SnapletInit, SnapletLens, makeSnaplet )
 import Snap.Snaplet.Auth
     ( AuthFailure(..), AuthManager(..), AuthSettings(..), AuthUser(..)
@@ -34,6 +36,8 @@ import qualified Data.Text.Encoding as T ( decodeUtf8, encodeUtf8 )
 import qualified Data.Text.Lazy as T ( toStrict )
 import qualified Data.Text.Lazy.Builder as T ( fromText, toLazyText )
 import qualified Database.Neo4j as Neo4j
+import qualified Database.Neo4j.Graph as Neo4j.Graph
+import qualified Database.Neo4j.Transactional.Cypher as Neo4j
 import qualified Snap.Snaplet.Auth as Auth
 
 import Snap.Snaplet.Neo4j.Internal ( Neo4jSnaplet(..) )
@@ -102,19 +106,26 @@ instance IAuthBackend Neo4jAuthManager where
         Nothing -> return $ Left BackendError
         -- Modify case
         Just userId -> return $ Left BackendError
-  lookupByUserId (Neo4jAuthManager neo4j _) userId = do
+
+  lookupByUserId (Neo4jAuthManager neo4j propertyNames) userId =
+      withNeo4jSnaplet neo4j $ runMaybeT $ do
+      node <- MaybeT $ Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
+      returnMaybe $ propsToAuthUser propertyNames
+          $ Neo4j.getNodeProperties node
+  
+  lookupByLogin = lookupByProperty propLogin
+
+  lookupByRememberToken = lookupByProperty propRememberToken
+
+  destroy (Neo4jAuthManager neo4j _) (AuthUser{userId}) = do
       withNeo4jSnaplet neo4j $ do
-        return ()
-      return Nothing
-  lookupByLogin (Neo4jAuthManager neo4j _) login = do
-      withNeo4jSnaplet neo4j $ do
-        return ()
-      return Nothing
-  lookupByRememberToken (Neo4jAuthManager neo4j _) token = do
-      withNeo4jSnaplet neo4j $ do
-        return ()
-      return Nothing
-  destroy (Neo4jAuthManager neo4j _) authUser = return ()
+        relTypes <- Neo4j.allRelationshipTypes
+        flip (maybe $ return ()) userId $ \userId -> do
+          zombieNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
+          flip (maybe $ return ()) zombieNode $ \zombieNode -> do
+            rels <- Neo4j.getRelationships zombieNode Neo4j.Any relTypes
+            mapM_ Neo4j.deleteRelationship rels
+            Neo4j.deleteNode zombieNode
 
 -- Convenience Functions
 
@@ -129,7 +140,7 @@ propsToAuthUser (PropertyNames{..}) properties = do
       { userId = Nothing
       , userLogin = login
       , userEmail = getTextProperty propEmail
-      , userPassword = fmap Auth.Encrypted $ getByteStringProperty propPassword
+      , userPassword = Auth.Encrypted <$> getByteStringProperty propPassword
       , userActivatedAt = getTimeProperty propActivatedAt
       , userSuspendedAt = getTimeProperty propSuspendedAt
       , userRememberToken = getTextProperty propRememberToken
@@ -178,7 +189,7 @@ authUserToProps (PropertyNames{..}) (AuthUser{..}) = do
     password <- case userPassword of
       Nothing -> return Nothing
       Just (Auth.Encrypted password) -> return $ Just password
-      Just (Auth.ClearText password) -> fmap Just $ Auth.encrypt password
+      Just (Auth.ClearText password) -> Just <$> Auth.encrypt password
     return $ foldl' (flip ($)) HM.empty $
       [ addTextProperty propLogin userLogin
       , might (addTextProperty propEmail) userEmail
@@ -214,16 +225,33 @@ authUserToProps (PropertyNames{..}) (AuthUser{..}) = do
 iso8601Format :: String
 iso8601Format = iso8601DateFormat $ Just "%H:%M:%S,%QZ"
 
+returnMaybe :: Monad m => Maybe a -> MaybeT m a
+returnMaybe = MaybeT . return
+
 -- Queries
 
-queryLookupByProperty
-  :: (PropertyNames -> T.Text) -> PropertyNames-> T.Text
-  -> (T.Text, Neo4j.Params)
-queryLookupByProperty prop (propertyNames@PropertyNames{indexUser}) login =
-    ( T.toStrict $ T.toLazyText $ mconcat
-      [ "MATCH (u", maybe "" ((":"<>) . T.fromText) indexUser, "{"
-      , T.fromText $ prop propertyNames, ":{", T.fromText paramProp
-      , "}}) RETURN u;"]
-    , HM.fromList [(paramProp, Neo4j.newparam login)]
-    )
+lookupByProperty
+  :: (PropertyNames -> T.Text) -> Neo4jAuthManager -> T.Text
+  -> IO (Maybe AuthUser)
+lookupByProperty prop (Neo4jAuthManager neo4j
+                       propertyNames@PropertyNames{indexUser}) value =
+    withNeo4jSnaplet neo4j $ runMaybeT $ do
+      eiResult <- lift $ uncurry Neo4j.loneQuery
+          $ queryLookupByProperty
+      graph <- case eiResult of
+        Right (Neo4j.Result{graph=[graph]}) -> return graph
+        _ -> fail ""
+      case Neo4j.Graph.getNodes graph of
+            [node] -> MaybeT $ return $ propsToAuthUser propertyNames
+                $ Neo4j.getNodeProperties node
+            _ -> fail ""
   where paramProp = "prop" :: T.Text
+        queryLookupByProperty =
+            ( T.toStrict $ T.toLazyText $ mconcat
+              [ "MATCH (u", maybe "" ((":"<>) . T.fromText) indexUser, "{"
+              , T.fromText $ prop propertyNames, ":{", T.fromText paramProp
+              , "}}) RETURN u;"
+              ]
+            , HM.fromList [(paramProp, Neo4j.newparam value)]
+            )
+
