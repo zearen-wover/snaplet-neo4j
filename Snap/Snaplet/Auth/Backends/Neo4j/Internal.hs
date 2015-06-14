@@ -1,11 +1,13 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 module Snap.Snaplet.Auth.Backends.Neo4j.Internal where
 
 import Control.Applicative ( (<$>) )
-import Control.Monad ( mapM_, sequence )
+import Control.Monad ( forM, forM_, mapM_, sequence )
 import Control.Monad.IO.Class ( liftIO )
+import Data.Maybe ( catMaybes )
 import Data.Monoid ( mconcat, (<>) ) 
 import Data.String ( fromString )
 import System.IO ( FilePath )
@@ -15,7 +17,7 @@ import Data.List ( foldl' )
 import Data.Time.Clock ( UTCTime )
 import Data.Time.Format ( formatTime, parseTime )
 import Data.Word ( Word8 )
-import Database.Neo4j ( Neo4j, Hostname, Port )
+import Database.Neo4j ( (|:), Neo4j, Hostname, Port )
 import Snap.Snaplet ( Snaplet, SnapletInit, SnapletLens, makeSnaplet )
 import Snap.Snaplet.Auth
     ( AuthManager(..), AuthSettings(..), AuthUser(..), IAuthBackend(..))
@@ -28,6 +30,7 @@ import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BS (toChunks)
 import qualified Data.HashMap.Strict as HM
+import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T ( decodeUtf8, encodeUtf8 )
 import qualified Data.Text.Lazy as T ( toStrict )
@@ -44,7 +47,6 @@ import Snap.Snaplet.Auth.Backends.Neo4j.Types (
 defaultNeo4jAuthPropNames :: PropertyNames
 defaultNeo4jAuthPropNames = PropertyNames
   { labelUser = "User"
-  , propRole = "role"
   , propLogin = "login"
   , propEmail = "email"
   , propPassword = "password"
@@ -65,6 +67,7 @@ defaultNeo4jAuthPropNames = PropertyNames
   , propMeta = "meta"
   , relROLE = "ROLE"
   , labelRole = "Role"
+  , propRole = "role"
   }
 
 mkNeo4jAuthManager :: Hostname -> Port -> PropertyNames -> Neo4jAuthManager
@@ -99,38 +102,41 @@ initNeo4jAuthManager (AuthSettings{..}) sessionManager neo4j propertyNames =
 instance IAuthBackend Neo4jAuthManager where
   save (Neo4jAuthManager neo4j (propertyNames@PropertyNames
                                 {labelUser, propLogin}))
-       (authUser@AuthUser{userId, userLogin}) = withNeo4jSnaplet neo4j $ do
-      properties <- liftIO $ authUserToProps propertyNames authUser
-      case userId of
-        -- Create case
-        Nothing -> do
-          nodes <- Neo4j.getNodesByLabelAndProperty labelUser $
-              Just (propLogin, Neo4j.ValueProperty $ Neo4j.TextVal userLogin)
-          case nodes of
-            _:_ -> return $ Left Auth.DuplicateLogin
-            [] -> do
-                node <- Neo4j.createNode properties
-                Neo4j.addLabels [labelUser] node
-                -- TODO: Add roles.
-                return $ Right $ authUser
-                    { userId = Just $ nodeToUserId node
-                    }
+       (authUser@AuthUser{userId, userLogin, userRoles}) =
+      withNeo4jSnaplet neo4j $ do
+        properties <- liftIO $ authUserToProps propertyNames authUser
+        case userId of
+          -- Create case
+          Nothing -> do
+            nodes <- Neo4j.getNodesByLabelAndProperty labelUser $
+                Just $ propLogin |: userLogin
+            case nodes of
+              _:_ -> return $ Left Auth.DuplicateLogin
+              [] -> do
+                  node <- Neo4j.createNode properties
+                  Neo4j.addLabels [labelUser] node
+                  forM userRoles $ connectNodeToRole propertyNames node
+                  return $ Right $ authUser
+                      { userId = Just $ nodeToUserId node
+                      }
 
-        -- Modify case
-        Just userId -> do
-          mbNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
-          case mbNode of
-            Just node -> do
-              Neo4j.setProperties node properties
-              -- TODO: Change roles.
-              return $ Right $ authUser
-            Nothing -> Left $ Auth.UserNotFound
+          -- Modify case
+          Just userId -> do
+            mbNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
+            case mbNode of
+              Just node -> do
+                Neo4j.setProperties node properties
+                syncRoles propertyNames node userRoles
+                return $ Right $ authUser
+              Nothing -> return $ Left $ Auth.UserNotFound
 
   lookupByUserId (Neo4jAuthManager neo4j propertyNames) userId =
       withNeo4jSnaplet neo4j $ do
         mbNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
         case mbNode of
-          Just node -> return $ nodeToAuthUser propertyNames node
+          Just node -> do
+            roles <- getRolesForNode propertyNames node
+            return $ nodeToAuthUser propertyNames node roles
           Nothing -> return Nothing -- This is still less code than using MaybeT
   
   lookupByLogin = lookupByProperty propLogin
@@ -156,8 +162,9 @@ withNeo4jSnaplet (Neo4jSnaplet hostname port) =
 nodeToUserId :: Neo4j.Node -> Auth.UserId
 nodeToUserId = Auth.UserId . T.decodeUtf8 . Neo4j.nodeId
 
-nodeToAuthUser :: PropertyNames -> Neo4j.Node -> Maybe AuthUser
-nodeToAuthUser (PropertyNames{..}) node = do
+nodeToAuthUser
+  :: PropertyNames -> Neo4j.Node -> [Auth.Role] -> Maybe AuthUser
+nodeToAuthUser (PropertyNames{..}) node roles = do
     login <- getTextProperty propLogin
     return AuthUser
       { userId = Just $ nodeToUserId node
@@ -178,7 +185,7 @@ nodeToAuthUser (PropertyNames{..}) node = do
       , userUpdatedAt = getTimeProperty propUpdatedAt
       , userResetToken = getTextProperty propResetToken
       , userResetRequestedAt = getTimeProperty propResetRequestedAt
-      , userRoles = []
+      , userRoles = roles
       , userMeta = maybe HM.empty id $ do
           jsonText <- getTextProperty propMeta
           Aeson.decode $ fromString $ T.unpack jsonText
@@ -240,12 +247,12 @@ authUserToProps (PropertyNames{..}) (AuthUser{..}) = do
         might = maybe id
         addIntProperty key =
             HM.insert key . Neo4j.ValueProperty . Neo4j.IntVal . fromIntegral
-        addTextProperty key = HM.insert key . Neo4j.ValueProperty . Neo4j.TextVal
+        addTextProperty key = HM.insert key . Neo4j.newval
         addTimeProperty key = addTextProperty key . T.pack .
                               formatTime defaultTimeLocale iso8601Format
         addByteStringProperty key =
-            HM.insert key . Neo4j.ArrayProperty .
-            map (Neo4j.IntVal . fromIntegral) . BS.unpack
+            HM.insert key . Neo4j.newval .
+            map (fromIntegral :: (Word8 -> Int64)) . BS.unpack
 
 iso8601Format :: String
 iso8601Format = iso8601DateFormat $ Just "%H:%M:%S,%QZ"
@@ -259,9 +266,59 @@ lookupByProperty prop (Neo4jAuthManager neo4j
                        propertyNames@PropertyNames{labelUser}) value =
     withNeo4jSnaplet neo4j $ do
       nodes <- Neo4j.getNodesByLabelAndProperty labelUser $
-          Just (prop propertyNames, Neo4j.ValueProperty $ Neo4j.TextVal value)
+          Just $ prop propertyNames |: value
       case nodes of
         [node] -> do
-           -- TODO: Get roles.
-           return $ nodeToAuthUser propertyNames node
+            roles <- getRolesForNode propertyNames node
+            return $ nodeToAuthUser propertyNames node roles
         _ -> fail ""
+
+getRolesForNode :: PropertyNames -> Neo4j.Node -> Neo4j [Auth.Role]
+getRolesForNode (PropertyNames{relROLE, propRole}) node = do
+    rels <- Neo4j.getRelationships node Neo4j.Outgoing [relROLE] 
+    fmap catMaybes $ forM rels $ \rel -> do
+       node <- Neo4j.getRelationshipTo rel
+       roleProp <- Neo4j.getProperty node propRole
+       case roleProp of
+         Just (Neo4j.ValueProperty (Neo4j.TextVal role)) ->
+             return $ Just $ Auth.Role $ T.encodeUtf8 role
+         _ -> return Nothing
+
+connectNodeToRole
+  :: PropertyNames -> Neo4j.Node -> Auth.Role -> Neo4j Neo4j.Node
+connectNodeToRole (PropertyNames{relROLE, labelRole, propRole}) node
+                  (Auth.Role txtRole) = do
+    let role = T.decodeUtf8 txtRole
+    roleNodes <- Neo4j.getNodesByLabelAndProperty labelRole $
+        Just $ propRole |: role
+    roleNode <- case roleNodes of
+      roleNode:_ -> return roleNode
+      [] -> Neo4j.createNode $ HM.fromList [(propRole |: role)]
+    Neo4j.createRelationship relROLE HM.empty node roleNode
+    return roleNode
+
+syncRoles :: PropertyNames -> Neo4j.Node -> [Auth.Role] -> Neo4j ()
+syncRoles (propertyNames@PropertyNames{relROLE, labelRole, propRole})
+          node roles = do
+    let desiredRoles = Set.fromList $
+            map (\(Auth.Role role) -> role) roles
+    rels <- Neo4j.getRelationships node Neo4j.Outgoing [relROLE] 
+
+    -- Look for undesired relationships 
+    remainingRoles <- fmap (Set.fromList . catMaybes) $ forM rels $ \rel -> do
+       roleNode <- Neo4j.getRelationshipTo rel
+       mbRoleProp <- Neo4j.getProperty node propRole
+       case mbRoleProp of
+         Just (Neo4j.ValueProperty (Neo4j.TextVal txtRole)) ->
+           let role = T.encodeUtf8 txtRole in
+           if role `Set.notMember` desiredRoles
+             then do
+               Neo4j.deleteRelationship rel
+               return Nothing
+             else return $ Just role
+         _ -> return Nothing
+
+    -- Add missing relationships.
+    forM_ (map Auth.Role $ Set.toList $ desiredRoles Set.\\ remainingRoles) $
+        connectNodeToRole propertyNames node 
+    return ()
