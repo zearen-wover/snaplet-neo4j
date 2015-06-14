@@ -1,5 +1,5 @@
 name:                snaplet-neo4j
-version:             0.0.0.0
+version:             0.0.0.5
 synopsis:            A snaplet for connecting to Neo4j
 -- description:         
 homepage:            http://github.com/zearen-wover/snaplet-neo4j

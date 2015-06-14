@@ -1,6 +1,6 @@
 module Snap.Snaplet.Neo4j
   ( Neo4jSnaplet
-  , HasNeo4j
+  , HasNeo4j(..)
   , neo4jInit
   , withNeo4j
   , withNeo4jSnaplet

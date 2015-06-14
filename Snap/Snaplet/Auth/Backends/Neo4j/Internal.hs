@@ -77,27 +77,32 @@ mkNeo4jAuthManager hostname port =
 initNeo4jAuthManager ::
   AuthSettings ->
   SnapletLens b SessionManager ->
-  Either Neo4jSnaplet (Hostname, Port) ->
+  Neo4jSnaplet ->
   PropertyNames ->
   SnapletInit b (AuthManager b)
-initNeo4jAuthManager (AuthSettings{..}) sessionManager neo4j propertyNames =
+initNeo4jAuthManager (AuthSettings{..}) sessionManager neo4j
+                     propertyNames@PropertyNames
+                     { labelUser, labelRole, propLogin, propRememberToken
+                     , propRole} =
     makeSnaplet "neo4j-auth" "Provides authentification via Neo4j" Nothing $
         liftIO $ do
-              key  <- getKey asSiteKey
-              rng  <- mkRNG
-              return AuthManager
-                { backend = flip Neo4jAuthManager propertyNames $ case neo4j of
-                    Left neo4jSnaplet -> neo4jSnaplet
-                    Right host_port -> uncurry Neo4jSnaplet host_port
-                , session = sessionManager
-                , activeUser = Nothing
-                , minPasswdLen = asMinPasswdLen
-                , rememberCookieName = asRememberCookieName
-                , rememberPeriod = asRememberPeriod
-                , siteKey = key
-                , lockout = asLockout
-                , randomNumberGenerator = rng
-                }
+          key  <- getKey asSiteKey
+          rng  <- mkRNG
+          withNeo4jSnaplet neo4j $ do
+              Neo4j.createIndex labelUser propLogin
+              Neo4j.createIndex labelUser propRememberToken
+              Neo4j.createIndex labelRole propRole
+          return AuthManager
+            { backend = Neo4jAuthManager neo4j propertyNames
+            , session = sessionManager
+            , activeUser = Nothing
+            , minPasswdLen = asMinPasswdLen
+            , rememberCookieName = asRememberCookieName
+            , rememberPeriod = asRememberPeriod
+            , siteKey = key
+            , lockout = asLockout
+            , randomNumberGenerator = rng
+            }
 
 instance IAuthBackend Neo4jAuthManager where
   save (Neo4jAuthManager neo4j (propertyNames@PropertyNames
