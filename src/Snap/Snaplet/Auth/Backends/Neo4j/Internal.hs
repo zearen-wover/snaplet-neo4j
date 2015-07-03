@@ -2,7 +2,6 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TemplateHaskell #-}
 module Snap.Snaplet.Auth.Backends.Neo4j.Internal where
 
 import Control.Applicative ( (<$>) )
@@ -24,7 +23,6 @@ import Snap.Snaplet.Session.Common ( mkRNG )
 import System.Locale ( defaultTimeLocale, iso8601DateFormat )
 import Web.ClientSession ( getKey )
 
-import qualified Control.Monad.Logger as Logger
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BS (toChunks)
@@ -59,14 +57,12 @@ initNeo4jAuthManager (AuthSettings{..}) sessionManager neo4j
                      , propRole} =
     makeSnaplet "neo4j-auth" "Provides authentification via Neo4j" Nothing $
         liftIO $ do
-          logDebug "make neo4j auth"
           key  <- getKey asSiteKey
           rng  <- mkRNG
           withNeo4jSnaplet neo4j $ do
               createIndexIfNeeded labelUser propLogin
               createIndexIfNeeded labelUser propRememberToken
               createIndexIfNeeded labelRole propRole
-          logDebug "Building AuthManager"
           return $! AuthManager
             { backend = Neo4jAuthManager neo4j propertyNames
             , session = sessionManager
@@ -83,17 +79,13 @@ instance IAuthBackend Neo4jAuthManager where
   save (Neo4jAuthManager neo4j (propertyNames@PropertyNames
                                 {labelUser, propLogin}))
        (authUser@AuthUser{userId, userLogin, userRoles}) = do
-      logDebug "Save"
       withNeo4jSnaplet neo4j $ do
-        logDebug "Convert auth -> props"
         properties <- liftIO $ authUserToProps propertyNames authUser
         case userId of
           -- Create case
           Nothing -> do
-            logDebug "Creating"
             nodes <- Neo4j.getNodesByLabelAndProperty labelUser $
                 Just $ propLogin |: userLogin
-            logDebug $ T.concat
                 [ "Nodes with login \"", userLogin, "\": "
                 , T.pack $ show $ length nodes
                 ]
@@ -101,20 +93,15 @@ instance IAuthBackend Neo4jAuthManager where
               _:_ -> return $ Left Auth.DuplicateLogin
               [] -> do
                   node <- Neo4j.createNode properties
-                  logDebug "Created node"
                   Neo4j.addLabels [labelUser] node
-                  logDebug $ T.concat [ "Added label ", labelUser ]
                   forM_ userRoles $ connectNodeToRole propertyNames node
-                  logDebug "Done connecting roles"
                   let au = authUser
                           { userId = Just $ nodeToUserId node
                           }
-                  logDebug $ T.concat [ "AuthUser: ", T.pack $ show au ]
                   return $ Right au
 
           -- Modify case
           Just userId' -> do
-            logDebug $ T.concat [ "Modifying", Auth.unUid userId' ]
             mbNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId'
             case mbNode of
               Just node -> do
@@ -241,7 +228,6 @@ authUserToProps (PropertyNames{..}) (AuthUser{..}) = do
       Nothing -> return Nothing
       Just (Auth.Encrypted password) -> return $ Just password
       Just (Auth.ClearText password) -> Just <$> Auth.encrypt password
-    logDebug $ T.concat ["Password: ", T.pack $ show password]
     return $ foldl' (flip ($)) HM.empty $
       [ addTextProperty propLogin userLogin
       , might (addTextProperty propEmail) userEmail
@@ -283,9 +269,6 @@ createIndexIfNeeded label propertyName = do
   if propertyName `elem` propertyNames
     then return ()
     else Neo4j.createIndex label propertyName >> return ()
-
-logDebug :: MonadIO io => T.Text -> io ()
-logDebug = Logger.runStdoutLoggingT . $(Logger.logDebug)
 
 -- Queries
 
