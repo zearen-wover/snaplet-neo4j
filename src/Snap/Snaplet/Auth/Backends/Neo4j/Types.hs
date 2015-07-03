@@ -1,16 +1,8 @@
 module Snap.Snaplet.Auth.Backends.Neo4j.Types
-  ( Neo4jAuthManager(..)
-  , PropertyNames(..)
+  ( PropertyNames(..)
   ) where
 
 import qualified Data.Text as T
-
-import Snap.Snaplet.Neo4j.Internal ( Neo4jSnaplet(..) )
-
-data Neo4jAuthManager = Neo4jAuthManager
-  { neo4jSnaplet :: Neo4jSnaplet
-  , propertyNames :: PropertyNames
-  }
 
 data PropertyNames = PropertyNames
   { labelUser :: T.Text
@@ -37,4 +29,3 @@ data PropertyNames = PropertyNames
   , propRole :: T.Text
   }
 
-  

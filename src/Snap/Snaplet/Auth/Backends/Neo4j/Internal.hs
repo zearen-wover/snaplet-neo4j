@@ -2,23 +2,21 @@
 {-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TemplateHaskell #-}
 module Snap.Snaplet.Auth.Backends.Neo4j.Internal where
 
 import Control.Applicative ( (<$>) )
-import Control.Monad ( forM, forM_, mapM_, sequence )
-import Control.Monad.IO.Class ( liftIO )
+import Control.Monad ( forM, forM_ )
+import Control.Monad.IO.Class ( MonadIO, liftIO )
 import Data.Maybe ( catMaybes )
-import Data.Monoid ( mconcat, (<>) ) 
 import Data.String ( fromString )
-import System.IO ( FilePath )
 
 import Data.Int ( Int64 )
 import Data.List ( foldl' )
-import Data.Time.Clock ( UTCTime )
 import Data.Time.Format ( formatTime, parseTime )
 import Data.Word ( Word8 )
 import Database.Neo4j ( (|:), Neo4j, Hostname, Port )
-import Snap.Snaplet ( Snaplet, SnapletInit, SnapletLens, makeSnaplet )
+import Snap.Snaplet ( SnapletInit, SnapletLens, makeSnaplet )
 import Snap.Snaplet.Auth
     ( AuthManager(..), AuthSettings(..), AuthUser(..), IAuthBackend(..))
 import Snap.Snaplet.Session ( SessionManager )
@@ -26,6 +24,7 @@ import Snap.Snaplet.Session.Common ( mkRNG )
 import System.Locale ( defaultTimeLocale, iso8601DateFormat )
 import Web.ClientSession ( getKey )
 
+import qualified Control.Monad.Logger as Logger
 import qualified Data.Aeson as Aeson
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BS (toChunks)
@@ -33,16 +32,119 @@ import qualified Data.HashMap.Strict as HM
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T ( decodeUtf8, encodeUtf8 )
-import qualified Data.Text.Lazy as T ( toStrict )
-import qualified Data.Text.Lazy.Builder as T ( fromText, toLazyText )
 import qualified Database.Neo4j as Neo4j
-import qualified Database.Neo4j.Graph as Neo4j.Graph
-import qualified Database.Neo4j.Transactional.Cypher as Neo4j
 import qualified Snap.Snaplet.Auth as Auth
 
 import Snap.Snaplet.Neo4j.Internal ( Neo4jSnaplet(..) )
-import Snap.Snaplet.Auth.Backends.Neo4j.Types (
-    Neo4jAuthManager(..), PropertyNames(..) )
+import Snap.Snaplet.Auth.Backends.Neo4j.Types ( PropertyNames(..) )
+
+data Neo4jAuthManager = Neo4jAuthManager
+  { neo4jSnaplet :: Neo4jSnaplet
+  , propertyNames :: PropertyNames
+  }
+
+mkNeo4jAuthManager :: Hostname -> Port -> PropertyNames -> Neo4jAuthManager
+mkNeo4jAuthManager hostname port =
+    Neo4jAuthManager $ Neo4jSnaplet hostname port
+
+initNeo4jAuthManager ::
+  AuthSettings ->
+  SnapletLens b SessionManager ->
+  Neo4jSnaplet ->
+  PropertyNames ->
+  SnapletInit b (AuthManager b)
+initNeo4jAuthManager (AuthSettings{..}) sessionManager neo4j
+                     propertyNames@PropertyNames
+                     { labelUser, labelRole, propLogin, propRememberToken
+                     , propRole} =
+    makeSnaplet "neo4j-auth" "Provides authentification via Neo4j" Nothing $
+        liftIO $ do
+          logDebug "make neo4j auth"
+          key  <- getKey asSiteKey
+          rng  <- mkRNG
+          withNeo4jSnaplet neo4j $ do
+              createIndexIfNeeded labelUser propLogin
+              createIndexIfNeeded labelUser propRememberToken
+              createIndexIfNeeded labelRole propRole
+          logDebug "Building AuthManager"
+          return $! AuthManager
+            { backend = Neo4jAuthManager neo4j propertyNames
+            , session = sessionManager
+            , activeUser = Nothing
+            , minPasswdLen = asMinPasswdLen
+            , rememberCookieName = asRememberCookieName
+            , rememberPeriod = asRememberPeriod
+            , siteKey = key
+            , lockout = asLockout
+            , randomNumberGenerator = rng
+            }
+
+instance IAuthBackend Neo4jAuthManager where
+  save (Neo4jAuthManager neo4j (propertyNames@PropertyNames
+                                {labelUser, propLogin}))
+       (authUser@AuthUser{userId, userLogin, userRoles}) = do
+      logDebug "Save"
+      withNeo4jSnaplet neo4j $ do
+        logDebug "Convert auth -> props"
+        properties <- liftIO $ authUserToProps propertyNames authUser
+        case userId of
+          -- Create case
+          Nothing -> do
+            logDebug "Creating"
+            nodes <- Neo4j.getNodesByLabelAndProperty labelUser $
+                Just $ propLogin |: userLogin
+            logDebug $ T.concat
+                [ "Nodes with login \"", userLogin, "\": "
+                , T.pack $ show $ length nodes
+                ]
+            case nodes of
+              _:_ -> return $ Left Auth.DuplicateLogin
+              [] -> do
+                  node <- Neo4j.createNode properties
+                  logDebug "Created node"
+                  Neo4j.addLabels [labelUser] node
+                  logDebug $ T.concat [ "Added label ", labelUser ]
+                  forM_ userRoles $ connectNodeToRole propertyNames node
+                  logDebug "Done connecting roles"
+                  let au = authUser
+                          { userId = Just $ nodeToUserId node
+                          }
+                  logDebug $ T.concat [ "AuthUser: ", T.pack $ show au ]
+                  return $ Right au
+
+          -- Modify case
+          Just userId' -> do
+            logDebug $ T.concat [ "Modifying", Auth.unUid userId' ]
+            mbNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId'
+            case mbNode of
+              Just node -> do
+                _ <- Neo4j.setProperties node properties
+                syncRoles propertyNames node userRoles
+                return $ Right $ authUser
+              Nothing -> return $ Left $ Auth.UserNotFound
+
+  lookupByUserId (Neo4jAuthManager neo4j propertyNames) userId =
+      withNeo4jSnaplet neo4j $ do
+        mbNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
+        case mbNode of
+          Just node -> do
+            roles <- getRolesForNode propertyNames node
+            return $ nodeToAuthUser propertyNames node roles
+          Nothing -> return Nothing -- This is still less code than using MaybeT
+  
+  lookupByLogin = lookupByProperty propLogin
+
+  lookupByRememberToken = lookupByProperty propRememberToken
+
+  destroy (Neo4jAuthManager neo4j _) (AuthUser{userId}) = do
+      withNeo4jSnaplet neo4j $ do
+        relTypes <- Neo4j.allRelationshipTypes
+        flip (maybe $ return ()) userId $ \userId' -> do
+          mbZombieNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId'
+          flip (maybe $ return ()) mbZombieNode $ \zombieNode -> do
+            rels <- Neo4j.getRelationships zombieNode Neo4j.Any relTypes
+            mapM_ Neo4j.deleteRelationship rels
+            Neo4j.deleteNode zombieNode
 
 defaultNeo4jAuthPropNames :: PropertyNames
 defaultNeo4jAuthPropNames = PropertyNames
@@ -69,94 +171,6 @@ defaultNeo4jAuthPropNames = PropertyNames
   , labelRole = "Role"
   , propRole = "role"
   }
-
-mkNeo4jAuthManager :: Hostname -> Port -> PropertyNames -> Neo4jAuthManager
-mkNeo4jAuthManager hostname port =
-    Neo4jAuthManager $ Neo4jSnaplet hostname port
-
-initNeo4jAuthManager ::
-  AuthSettings ->
-  SnapletLens b SessionManager ->
-  Neo4jSnaplet ->
-  PropertyNames ->
-  SnapletInit b (AuthManager b)
-initNeo4jAuthManager (AuthSettings{..}) sessionManager neo4j
-                     propertyNames@PropertyNames
-                     { labelUser, labelRole, propLogin, propRememberToken
-                     , propRole} =
-    makeSnaplet "neo4j-auth" "Provides authentification via Neo4j" Nothing $
-        liftIO $ do
-          key  <- getKey asSiteKey
-          rng  <- mkRNG
-          withNeo4jSnaplet neo4j $ do
-              Neo4j.createIndex labelUser propLogin
-              Neo4j.createIndex labelUser propRememberToken
-              Neo4j.createIndex labelRole propRole
-          return AuthManager
-            { backend = Neo4jAuthManager neo4j propertyNames
-            , session = sessionManager
-            , activeUser = Nothing
-            , minPasswdLen = asMinPasswdLen
-            , rememberCookieName = asRememberCookieName
-            , rememberPeriod = asRememberPeriod
-            , siteKey = key
-            , lockout = asLockout
-            , randomNumberGenerator = rng
-            }
-
-instance IAuthBackend Neo4jAuthManager where
-  save (Neo4jAuthManager neo4j (propertyNames@PropertyNames
-                                {labelUser, propLogin}))
-       (authUser@AuthUser{userId, userLogin, userRoles}) =
-      withNeo4jSnaplet neo4j $ do
-        properties <- liftIO $ authUserToProps propertyNames authUser
-        case userId of
-          -- Create case
-          Nothing -> do
-            nodes <- Neo4j.getNodesByLabelAndProperty labelUser $
-                Just $ propLogin |: userLogin
-            case nodes of
-              _:_ -> return $ Left Auth.DuplicateLogin
-              [] -> do
-                  node <- Neo4j.createNode properties
-                  Neo4j.addLabels [labelUser] node
-                  forM userRoles $ connectNodeToRole propertyNames node
-                  return $ Right $ authUser
-                      { userId = Just $ nodeToUserId node
-                      }
-
-          -- Modify case
-          Just userId -> do
-            mbNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
-            case mbNode of
-              Just node -> do
-                Neo4j.setProperties node properties
-                syncRoles propertyNames node userRoles
-                return $ Right $ authUser
-              Nothing -> return $ Left $ Auth.UserNotFound
-
-  lookupByUserId (Neo4jAuthManager neo4j propertyNames) userId =
-      withNeo4jSnaplet neo4j $ do
-        mbNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
-        case mbNode of
-          Just node -> do
-            roles <- getRolesForNode propertyNames node
-            return $ nodeToAuthUser propertyNames node roles
-          Nothing -> return Nothing -- This is still less code than using MaybeT
-  
-  lookupByLogin = lookupByProperty propLogin
-
-  lookupByRememberToken = lookupByProperty propRememberToken
-
-  destroy (Neo4jAuthManager neo4j _) (AuthUser{userId}) = do
-      withNeo4jSnaplet neo4j $ do
-        relTypes <- Neo4j.allRelationshipTypes
-        flip (maybe $ return ()) userId $ \userId -> do
-          zombieNode <- Neo4j.getNode $ T.encodeUtf8 $ Auth.unUid userId
-          flip (maybe $ return ()) zombieNode $ \zombieNode -> do
-            rels <- Neo4j.getRelationships zombieNode Neo4j.Any relTypes
-            mapM_ Neo4j.deleteRelationship rels
-            Neo4j.deleteNode zombieNode
 
 -- Convenience Functions
 
@@ -227,6 +241,7 @@ authUserToProps (PropertyNames{..}) (AuthUser{..}) = do
       Nothing -> return Nothing
       Just (Auth.Encrypted password) -> return $ Just password
       Just (Auth.ClearText password) -> Just <$> Auth.encrypt password
+    logDebug $ T.concat ["Password: ", T.pack $ show password]
     return $ foldl' (flip ($)) HM.empty $
       [ addTextProperty propLogin userLogin
       , might (addTextProperty propEmail) userEmail
@@ -262,6 +277,16 @@ authUserToProps (PropertyNames{..}) (AuthUser{..}) = do
 iso8601Format :: String
 iso8601Format = iso8601DateFormat $ Just "%H:%M:%S,%QZ"
 
+createIndexIfNeeded :: T.Text -> T.Text -> Neo4j ()
+createIndexIfNeeded label propertyName = do
+  propertyNames <- concatMap Neo4j.indexProperties <$> Neo4j.getIndexes label
+  if propertyName `elem` propertyNames
+    then return ()
+    else Neo4j.createIndex label propertyName >> return ()
+
+logDebug :: MonadIO io => T.Text -> io ()
+logDebug = Logger.runStdoutLoggingT . $(Logger.logDebug)
+
 -- Queries
 
 lookupByProperty
@@ -276,14 +301,14 @@ lookupByProperty prop (Neo4jAuthManager neo4j
         [node] -> do
             roles <- getRolesForNode propertyNames node
             return $ nodeToAuthUser propertyNames node roles
-        _ -> fail ""
+        _ -> return Nothing
 
 getRolesForNode :: PropertyNames -> Neo4j.Node -> Neo4j [Auth.Role]
 getRolesForNode (PropertyNames{relROLE, propRole}) node = do
     rels <- Neo4j.getRelationships node Neo4j.Outgoing [relROLE] 
     fmap catMaybes $ forM rels $ \rel -> do
-       node <- Neo4j.getRelationshipTo rel
-       roleProp <- Neo4j.getProperty node propRole
+       roleNode <- Neo4j.getRelationshipTo rel
+       roleProp <- Neo4j.getProperty roleNode propRole
        case roleProp of
          Just (Neo4j.ValueProperty (Neo4j.TextVal role)) ->
              return $ Just $ Auth.Role $ T.encodeUtf8 role
@@ -299,11 +324,11 @@ connectNodeToRole (PropertyNames{relROLE, labelRole, propRole}) node
     roleNode <- case roleNodes of
       roleNode:_ -> return roleNode
       [] -> Neo4j.createNode $ HM.fromList [(propRole |: role)]
-    Neo4j.createRelationship relROLE HM.empty node roleNode
+    _ <- Neo4j.createRelationship relROLE HM.empty node roleNode
     return roleNode
 
 syncRoles :: PropertyNames -> Neo4j.Node -> [Auth.Role] -> Neo4j ()
-syncRoles (propertyNames@PropertyNames{relROLE, labelRole, propRole})
+syncRoles (propertyNames@PropertyNames{relROLE, propRole})
           node roles = do
     let desiredRoles = Set.fromList $
             map (\(Auth.Role role) -> role) roles
@@ -312,7 +337,7 @@ syncRoles (propertyNames@PropertyNames{relROLE, labelRole, propRole})
     -- Look for undesired relationships 
     remainingRoles <- fmap (Set.fromList . catMaybes) $ forM rels $ \rel -> do
        roleNode <- Neo4j.getRelationshipTo rel
-       mbRoleProp <- Neo4j.getProperty node propRole
+       mbRoleProp <- Neo4j.getProperty roleNode propRole
        case mbRoleProp of
          Just (Neo4j.ValueProperty (Neo4j.TextVal txtRole)) ->
            let role = T.encodeUtf8 txtRole in
